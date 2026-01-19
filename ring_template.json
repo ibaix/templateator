@@ -1,0 +1,85 @@
+{
+  "name": "ring_150_2D",
+  "version": "1.0",
+  "units": "mm",
+  "profile_plane": "XZ",
+  "base_height_mm": 0.15,
+
+  "metadata": {
+    "author": "KIROSHI",
+    "created": "2026-01-08",
+    "source": "Converted from ring_template.inp (HyperMesh 2019.1)",
+    "description": "Ring reference 150 - 2D cross-section profile for revolution",
+    "notes": "Coordinates relative to ring center axis. Profile in X-Z plane (Y=0)."
+  },
+
+  "nodes": [
+    {"id": 1,  "x": -0.299999999,    "y": 0.0, "z": 0.0},
+    {"id": 2,  "x": -0.203385123279, "y": 0.0, "z": 0.0},
+    {"id": 3,  "x": -0.106770247558, "y": 0.0, "z": 0.0},
+    {"id": 4,  "x": -0.008645619527, "y": 0.0, "z": 0.0},
+    {"id": 5,  "x":  0.1,            "y": 0.0, "z": 0.0},
+    {"id": 6,  "x":  0.19999999975,  "y": 0.0, "z": 0.0},
+    {"id": 7,  "x":  0.2999999995,   "y": 0.0, "z": 0.0},
+    {"id": 8,  "x":  0.39999999925,  "y": 0.0, "z": 0.0},
+    {"id": 20, "x":  0.499999999,    "y": 0.0, "z": 0.0},
+    {"id": 21, "x":  0.39999999925,  "y": 0.0, "z": 0.0375},
+    {"id": 22, "x":  0.2999999995,   "y": 0.0, "z": 0.075},
+    {"id": 23, "x":  0.19999999975,  "y": 0.0, "z": 0.1125},
+    {"id": 29, "x":  0.1,            "y": 0.0, "z": 0.15},
+    {"id": 32, "x": -0.008645619527, "y": 0.0, "z": 0.1523377114975},
+    {"id": 33, "x": -0.106770247558, "y": 0.0, "z": 0.1035159386422},
+    {"id": 34, "x": -0.1599999995,   "y": 0.0, "z": 0.075},
+    {"id": 35, "x":  0.1,            "y": 0.0, "z": 0.075},
+    {"id": 36, "x": -0.008645619527, "y": 0.0, "z": 0.075},
+    {"id": 37, "x": -0.106770247558, "y": 0.0, "z": 0.075},
+    {"id": 38, "x":  0.19999999975,  "y": 0.0, "z": 0.075}
+  ],
+
+  "elements": [
+    {"id": 1,  "type": "QUAD", "nodes": [33, 34, 2, 3]},
+    {"id": 4,  "type": "QUAD", "nodes": [33, 3, 36, 37]},
+    {"id": 7,  "type": "QUAD", "nodes": [32, 33, 37, 36]},
+    {"id": 8,  "type": "QUAD", "nodes": [6, 5, 35, 38]},
+    {"id": 9,  "type": "QUAD", "nodes": [22, 7, 6, 38]},
+    {"id": 12, "type": "QUAD", "nodes": [34, 37, 3, 2]},
+    {"id": 13, "type": "QUAD", "nodes": [35, 38, 7, 6]},
+
+    {"id": 2,  "type": "TRI", "nodes": [21, 20, 8]},
+    {"id": 3,  "type": "TRI", "nodes": [22, 21, 8]},
+    {"id": 5,  "type": "TRI", "nodes": [23, 38, 22]},
+    {"id": 6,  "type": "TRI", "nodes": [38, 23, 29]},
+    {"id": 10, "type": "TRI", "nodes": [38, 7, 22]},
+    {"id": 11, "type": "TRI", "nodes": [22, 7, 8]}
+  ],
+
+  "boundary_nodes": {
+    "inf_int": 1,
+    "inf_ext": 20,
+    "sup_int": 32,
+    "sup_ext": 29
+  },
+
+  "surfaces": {
+    "RING_SURF_SUP": [
+      {"element": 1,  "face": 1},
+      {"element": 2,  "face": 1},
+      {"element": 3,  "face": 1},
+      {"element": 5,  "face": 2},
+      {"element": 6,  "face": 2},
+      {"element": 10, "face": 3},
+      {"element": 11, "face": 3},
+      {"element": 13, "face": 3}
+    ],
+    "RING_SURF_INF": [
+      {"element": 2,  "face": 2},
+      {"element": 3,  "face": 3},
+      {"element": 4,  "face": 3},
+      {"element": 7,  "face": 1},
+      {"element": 8,  "face": 1},
+      {"element": 9,  "face": 2},
+      {"element": 12, "face": 3},
+      {"element": 13, "face": 2}
+    ]
+  }
+}
