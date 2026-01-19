@@ -131,10 +131,31 @@ def run(context):
             return
 
         # Extract nodes from sketch points
-        nodes = extract_nodes_from_sketch(sketch)
+        nodes, filter_stats = extract_nodes_from_sketch(sketch)
         if not nodes:
-            ui.messageBox("No sketch points found in the selected sketch.\n\nAdd sketch points to define mesh nodes.")
+            ui.messageBox(
+                "No valid sketch points found in the selected sketch.\n\n"
+                f"Points examined: {filter_stats['total_examined']}\n"
+                f"Skipped (origin): {filter_stats['skipped_origin']}\n"
+                f"Skipped (circle/arc centers): {filter_stats['skipped_centers']}\n"
+                f"Skipped (duplicates): {filter_stats['skipped_duplicates']}\n\n"
+                "Add sketch points using the Point tool to define mesh nodes."
+            )
             return
+
+        # Show filtering summary if any points were filtered
+        filtered_count = filter_stats["skipped_centers"] + filter_stats["skipped_duplicates"]
+        if filtered_count > 0:
+            ui.messageBox(
+                f"Point Extraction Summary\n\n"
+                f"Total points examined: {filter_stats['total_examined']}\n"
+                f"Valid nodes extracted: {len(nodes)}\n\n"
+                f"Filtered out:\n"
+                f"  • Circle/arc centers: {filter_stats['skipped_centers']}\n"
+                f"  • Duplicate coordinates: {filter_stats['skipped_duplicates']}\n"
+                f"  • Origin point: {filter_stats['skipped_origin']}",
+                "Point Filtering Applied"
+            )
 
         # Get elements (predefined or interactive)
         if USE_PREDEFINED_ELEMENTS:
@@ -253,14 +274,64 @@ def extract_nodes_from_sketch(sketch):
 
     Points are numbered by their creation order in the sketch.
     Coordinates are converted to mm and mapped to X-Z plane (Y=0).
+
+    Filters out:
+    - Origin point (0,0,0)
+    - Circle/arc center points (geometric construction points)
+    - Duplicate coordinates (within tolerance)
+
+    Returns
+    -------
+    tuple
+        (nodes, filter_stats) where filter_stats is a dict with counts
+        of skipped points by reason.
     """
+
+    # Build set of center points to exclude (circle/arc centers)
+    # These are automatically created when drawing circles/arcs and
+    # are not explicitly placed points
+    center_points = set()
+
+    # Collect circle center points
+    for circle in sketch.sketchCurves.sketchCircles:
+        center_points.add(circle.centerSketchPoint)
+
+    # Collect arc center points
+    for arc in sketch.sketchCurves.sketchArcs:
+        center_points.add(arc.centerSketchPoint)
+
+    # Collect ellipse center points
+    for ellipse in sketch.sketchCurves.sketchEllipses:
+        center_points.add(ellipse.centerSketchPoint)
+
+    # Collect elliptical arc center points
+    for elliptical_arc in sketch.sketchCurves.sketchEllipticalArcs:
+        center_points.add(elliptical_arc.centerSketchPoint)
+
     nodes = []
     node_id = 1
+    seen_coords = []  # List of (x, z) tuples for duplicate detection
+    tolerance = 1e-6  # Coordinate tolerance for duplicate detection (mm)
 
-    # Get all sketch points (excluding the origin point)
+    filter_stats = {
+        "skipped_origin": 0,
+        "skipped_centers": 0,
+        "skipped_duplicates": 0,
+        "total_examined": 0,
+    }
+
+    # Get all sketch points, filtering out unwanted ones
     for point in sketch.sketchPoints:
+        filter_stats["total_examined"] += 1
+
         # Skip the origin reference point
         if point.geometry.isEqualTo(adsk.core.Point3D.create(0, 0, 0)):
+            filter_stats["skipped_origin"] += 1
+            continue
+
+        # Skip circle/arc/ellipse center points (construction geometry)
+        if point in center_points:
+            filter_stats["skipped_centers"] += 1
             continue
 
         geo = point.geometry
@@ -268,16 +339,32 @@ def extract_nodes_from_sketch(sketch):
         # Convert coordinates based on Fusion document units
         # Map Fusion XY to template XZ (profile in XZ plane, Y=0)
         scale = 10.0 if FUSION_UNITS == "cm" else 1.0  # cm->mm or mm->mm
+        x = round(geo.x * scale, 9)
+        z = round(geo.y * scale, 9)  # Fusion Y -> Template Z
+
+        # Check for duplicate coordinates (within tolerance)
+        is_duplicate = False
+        for seen_x, seen_z in seen_coords:
+            if abs(x - seen_x) < tolerance and abs(z - seen_z) < tolerance:
+                is_duplicate = True
+                filter_stats["skipped_duplicates"] += 1
+                break
+
+        if is_duplicate:
+            continue
+
+        seen_coords.append((x, z))
+
         node = {
             "id": node_id,
-            "x": round(geo.x * scale, 9),
+            "x": x,
             "y": 0.0,
-            "z": round(geo.y * scale, 9)  # Fusion Y -> Template Z
+            "z": z
         }
         nodes.append(node)
         node_id += 1
 
-    return nodes
+    return nodes, filter_stats
 
 
 def define_elements_interactive(ui, nodes):

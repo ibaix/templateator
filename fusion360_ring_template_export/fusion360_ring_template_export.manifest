@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "script",
+    "author": "ibaix",
+    "description": {
+        "": "Export sketch points as JSON ring template for KIROSHI mesh generator"
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
