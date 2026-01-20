@@ -1,39 +1,29 @@
 #Author-KIROSHI
-#Description-Export sketch points as JSON ring template for KIROSHI mesh generator
+#Description-Export boundary profile from 3D body intersection with midplane for GMSH meshing
 
 # pyright: reportMissingImports=false
 # type: ignore[import]
 
 """
-Fusion 360 Add-In Script: Ring Template JSON Exporter
+Fusion 360 Add-In Script: Boundary Profile Exporter
 
 Run the script from within Fusion 360 (Scripts and Add-Ins > Shift+S).
 
-This script extracts sketch points from a Fusion 360 sketch and exports them
-as a JSON template file compatible with the KIROSHI mesh generator.
+This script extracts the outer boundary profile by intersecting a 3D body
+with a construction plane, then exports the boundary curves to JSON format
+for meshing with GMSH.
 
-USAGE:
-1. Open Fusion 360 with your ring cross-section sketch
+WORKFLOW:
+1. Ensure your design has a 3D body and a construction plane named "midplane_real"
 2. Run this script from Scripts and Add-Ins (Shift+S)
-3. Select the sketch containing the ring profile points
-4. Define elements interactively or modify PREDEFINED_ELEMENTS below
-5. Choose output file location
+3. Script automatically intersects body with plane and extracts outer profile
+4. Save the boundary.json file
+5. Use mesh_with_gmsh.py to generate the mesh template
 
 COORDINATE SYSTEM:
-- Fusion 360 coordinate units are configurable (see FUSION_UNITS below)
-- Fusion XY plane maps to template XZ plane (Y=0)
+- Fusion 360 XY plane maps to template XZ plane (Y=0)
 - X = radial direction (inner to outer)
 - Z = thickness direction (bottom to top)
-
-ELEMENT DEFINITION (first-order, linear):
-- QUAD or QUAD4: 4 nodes (corners only), counter-clockwise order
-- TRI or TRI3: 3 nodes (corners only), counter-clockwise order
-
-ELEMENT DEFINITION (second-order, quadratic - curved edges):
-- QUAD8: 8 nodes (4 corners + 4 mid-edge), counter-clockwise order
-         Node order: corners 1-4, then mid-edges 5-8
-- TRI6: 6 nodes (3 corners + 3 mid-edge), counter-clockwise order
-        Node order: corners 1-3, then mid-edges 4-6
 """
 
 import adsk.core
@@ -41,74 +31,30 @@ import adsk.fusion
 import traceback
 import json
 import os
+import math
 from datetime import datetime
 
 # ============================================================================
-# CONFIGURATION - Modify these values for your template
+# CONFIGURATION
 # ============================================================================
 
-TEMPLATE_NAME = "ring_150_2D"
-OUTPUT_FILENAME = "ring_template.json"
+# Name for the output template
+TEMPLATE_NAME = "ring_150_boundary"
+OUTPUT_FILENAME = "boundary.json"
 
-# Sketch and plane auto-detection
-# The script will automatically find a sketch with this name
-TEMPLATE_SKETCH_NAME = "template"
-# Optional: Validate the sketch is on this plane (set to None to skip validation)
-MIDPLANE_NAME = "midplane"
+# Output directory for boundary files (relative to script location)
+# The script is in: fusion360_ring_template_export/
+# The boundaries folder is: ../boundaries/
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+BOUNDARIES_FOLDER = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "boundaries"))
 
-# Boundary node IDs (identify which nodes are at the edges after revolution)
-# These must be set based on YOUR specific ring geometry after defining nodes.
-# Leave as None/empty if not yet determined - you can add them to the JSON later.
-#   inf_int: Node at inner edge, bottom surface (z=0, smallest x)
-#   inf_ext: Node at outer edge, bottom surface (z=0, largest x)
-#   sup_int: Node at inner edge, top surface (z=max, smallest x)
-#   sup_ext: Node at outer edge, top surface (z=max, largest x)
-BOUNDARY_NODES = {
-    "inf_int": None,
-    "inf_ext": None,
-    "sup_int": None,
-    "sup_ext": None
-}
-
-# Base height for scaling reference (mm)
-# This should be the actual height (Z extent) of your ring profile.
-# Set to None to auto-calculate from node coordinates, or specify manually.
-BASE_HEIGHT_MM = None  # Auto-calculated from nodes if None
+# Construction plane to use for intersection
+MIDPLANE_NAME = "midplane_real"
 
 # Fusion 360 document units setting
 # Set to "mm" if your Fusion 360 document uses millimeters
 # Set to "cm" if your Fusion 360 document uses centimeters (Fusion default)
-# The script will convert to mm for the output template
-FUSION_UNITS = "mm"  # Change to "cm" if using Fusion's default centimeter units
-
-# Set to True to use predefined elements instead of interactive definition
-USE_PREDEFINED_ELEMENTS = False
-
-# Predefined element connectivity (if USE_PREDEFINED_ELEMENTS is True)
-# Format: {"id": int, "type": "QUAD"|"QUAD8"|"TRI"|"TRI6", "nodes": [...]}
-# Define your elements here based on your specific ring geometry node IDs
-#
-# First-order (linear) elements - straight edges:
-#   {"id": 1, "type": "QUAD", "nodes": [1, 2, 4, 3]},      # 4 corners, CCW
-#   {"id": 2, "type": "TRI", "nodes": [5, 6, 7]},          # 3 corners, CCW
-#
-# Second-order (quadratic) elements - curved edges possible:
-#   {"id": 1, "type": "QUAD8", "nodes": [1,2,3,4, 5,6,7,8]}, # 4 corners + 4 mid-edge
-#   {"id": 2, "type": "TRI6", "nodes": [1,2,3, 4,5,6]},      # 3 corners + 3 mid-edge
-#
-# For QUAD8: nodes 1-4 are corners (CCW), nodes 5-8 are mid-edges (CCW, starting between 1-2)
-# For TRI6: nodes 1-3 are corners (CCW), nodes 4-6 are mid-edges (CCW, starting between 1-2)
-PREDEFINED_ELEMENTS = [
-    # Add your elements here after defining nodes
-]
-
-# Surface definitions (optional, for contact surfaces in FEBio)
-# Define element faces for contact surfaces if needed
-# Example:
-#   "RING_SURF_SUP": [{"element": 1, "face": 1}, {"element": 2, "face": 1}],
-PREDEFINED_SURFACES = {
-    # Add your surfaces here after defining elements
-}
+FUSION_UNITS = "mm"
 
 # ============================================================================
 # MAIN SCRIPT
@@ -122,391 +68,588 @@ def run(context):
         design = adsk.fusion.Design.cast(app.activeProduct)
 
         if not design:
-            ui.messageBox("No active Fusion 360 design found.\n\nPlease open a design with a ring profile sketch.")
-            return
-
-        # Get the active sketch or let user select one
-        sketch = get_target_sketch(ui, design)
-        if not sketch:
-            return
-
-        # Extract nodes from sketch points
-        nodes, filter_stats = extract_nodes_from_sketch(sketch)
-        if not nodes:
             ui.messageBox(
-                "No valid sketch points found in the selected sketch.\n\n"
-                f"Points examined: {filter_stats['total_examined']}\n"
-                f"Skipped (origin): {filter_stats['skipped_origin']}\n"
-                f"Skipped (circle/arc centers): {filter_stats['skipped_centers']}\n"
-                f"Skipped (duplicates): {filter_stats['skipped_duplicates']}\n\n"
-                "Add sketch points using the Point tool to define mesh nodes."
+                "No active Fusion 360 design found.\n\n"
+                "Please open a design with a 3D body and construction plane."
             )
             return
 
-        # Show filtering summary if any points were filtered
-        filtered_count = filter_stats["skipped_centers"] + filter_stats["skipped_duplicates"]
-        if filtered_count > 0:
+        # Step 1: Find the midplane construction plane
+        plane = find_plane_by_name(design, MIDPLANE_NAME)
+        if not plane:
             ui.messageBox(
-                f"Point Extraction Summary\n\n"
-                f"Total points examined: {filter_stats['total_examined']}\n"
-                f"Valid nodes extracted: {len(nodes)}\n\n"
-                f"Filtered out:\n"
-                f"  • Circle/arc centers: {filter_stats['skipped_centers']}\n"
-                f"  • Duplicate coordinates: {filter_stats['skipped_duplicates']}\n"
-                f"  • Origin point: {filter_stats['skipped_origin']}",
-                "Point Filtering Applied"
+                f"Could not find construction plane '{MIDPLANE_NAME}'.\n\n"
+                "Please create a construction plane with this name in your design."
             )
+            return
 
-        # Get elements (predefined or interactive)
-        if USE_PREDEFINED_ELEMENTS:
-            elements = PREDEFINED_ELEMENTS
-            surfaces = PREDEFINED_SURFACES
+        # Step 2: Get the component and bodies
+        root_comp = design.rootComponent
+        bodies = root_comp.bRepBodies
+        
+        if bodies.count == 0:
+            ui.messageBox(
+                "No 3D bodies found in the design.\n\n"
+                "Please create a 3D body first."
+            )
+            return
+
+        # If multiple bodies, let user select which one
+        target_body = None
+        if bodies.count == 1:
+            target_body = bodies.item(0)
         else:
-            elements = define_elements_interactive(ui, nodes)
-            surfaces = {}
-            if not elements:
-                ui.messageBox("No elements defined. Template export cancelled.")
+            # Ask user to select a body
+            ui.messageBox(
+                f"Found {bodies.count} bodies. Please select the body to extract profile from.",
+                "Select Body"
+            )
+            selection = ui.selectEntity(
+                "Select the body to extract profile from",
+                "Bodies"
+            )
+            if selection:
+                target_body = selection.entity
+            else:
                 return
 
-        # Validate elements reference existing nodes
-        node_ids = {n["id"] for n in nodes}
-        for elem in elements:
-            for nid in elem["nodes"]:
-                if nid not in node_ids:
-                    ui.messageBox(
-                        f"Element {elem['id']} references node {nid} which doesn't exist.\n\n"
-                        f"Available node IDs: {sorted(node_ids)}"
-                    )
-                    return
+        # Step 3: Create intersection sketch
+        ui.messageBox(
+            f"Creating intersection with plane '{MIDPLANE_NAME}'...\n\n"
+            f"Body: {target_body.name}",
+            "Extracting Profile"
+        )
 
-        # Build the JSON structure
-        template = build_template_json(nodes, elements, surfaces)
+        sketch, created_new = create_intersection_sketch(root_comp, plane, target_body)
+        if not sketch:
+            ui.messageBox(
+                "Failed to create intersection sketch.\n\n"
+                "Make sure the plane intersects the body."
+            )
+            return
 
-        # Save to file
+        # Step 4: Extract the outer profile
+        if sketch.profiles.count == 0:
+            ui.messageBox(
+                "No closed profiles found from intersection.\n\n"
+                "Make sure the plane passes through the body."
+            )
+            # Clean up if we created a new sketch
+            if created_new:
+                sketch.deleteMe()
+            return
+
+        outer_profile = get_outer_profile(sketch)
+        if not outer_profile:
+            ui.messageBox(
+                "Could not determine outer profile.\n\n"
+                "The intersection may not form a closed loop."
+            )
+            if created_new:
+                sketch.deleteMe()
+            return
+
+        # Step 5: Extract curves from the outer profile
+        curves = extract_boundary_curves(outer_profile, sketch)
+        vertices = extract_boundary_vertices(outer_profile, sketch)
+
+        if not curves:
+            ui.messageBox(
+                "No curves extracted from profile.\n\n"
+                "The profile may be empty or invalid."
+            )
+            if created_new:
+                sketch.deleteMe()
+            return
+
+        # Step 6: Build and save JSON
+        boundary_data = build_boundary_json(curves, vertices)
+
+        # Get output file path from user
         output_path = get_output_path(ui)
         if output_path:
             with open(output_path, "w", encoding="utf-8") as f:
-                json.dump(template, f, indent=2)
+                json.dump(boundary_data, f, indent=2)
+            
+            # Summary
+            line_count = sum(1 for c in curves if c["type"] == "line")
+            arc_count = sum(1 for c in curves if c["type"] == "arc")
+            spline_count = sum(1 for c in curves if c["type"] == "spline")
+            
             ui.messageBox(
-                f"Template exported successfully!\n\n"
-                f"File: {output_path}\n"
-                f"Nodes: {len(nodes)}\n"
-                f"Elements: {len(elements)}\n"
-                f"Surfaces: {len(surfaces)}"
+                f"Boundary exported successfully!\n\n"
+                f"File: {output_path}\n\n"
+                f"Curves: {len(curves)}\n"
+                f"  • Lines: {line_count}\n"
+                f"  • Arcs: {arc_count}\n"
+                f"  • Splines: {spline_count}\n\n"
+                f"Vertices: {len(vertices)}\n\n"
+                f"Next step: Run mesh_with_gmsh.py to generate the mesh.",
+                "Export Complete"
             )
+
+        # Clean up the temporary sketch if we created it
+        if created_new:
+            result = ui.messageBox(
+                "Delete the temporary intersection sketch?",
+                "Cleanup",
+                adsk.core.MessageBoxButtonTypes.YesNoButtonType
+            )
+            if result == adsk.core.DialogResults.DialogYes:
+                sketch.deleteMe()
 
     except:
         if ui:
             ui.messageBox(f"Script failed:\n\n{traceback.format_exc()}")
 
 
-def get_target_sketch(ui, design):
-    """Find the 'template' sketch automatically, or let user select."""
-
-    # First, try to auto-detect sketch by name
-    template_sketch = None
+def find_plane_by_name(design, plane_name):
+    """Find a construction plane by name in the design.
+    
+    Searches through all components for a construction plane matching the name.
+    
+    Parameters
+    ----------
+    design : adsk.fusion.Design
+        The active Fusion 360 design
+    plane_name : str
+        Name of the construction plane to find
+        
+    Returns
+    -------
+    adsk.fusion.ConstructionPlane or None
+        The found plane, or None if not found
+    """
+    plane_name_lower = plane_name.lower()
+    
+    # Search in all components
     for comp in design.allComponents:
-        for sketch in comp.sketches:
-            if sketch.name.lower() == TEMPLATE_SKETCH_NAME.lower():
-                # Validate it's on the correct plane if MIDPLANE_NAME is set
-                if MIDPLANE_NAME:
-                    ref_plane = sketch.referencePlane
-                    plane_name = getattr(ref_plane, 'name', None)
-                    if plane_name and plane_name.lower() != MIDPLANE_NAME.lower():
-                        # Found sketch but on wrong plane, continue searching
-                        continue
-                template_sketch = sketch
-                break
-        if template_sketch:
-            break
-
-    if template_sketch:
-        # Found the template sketch, confirm with user
-        plane_info = ""
-        if MIDPLANE_NAME:
-            ref_plane = template_sketch.referencePlane
-            plane_name = getattr(ref_plane, 'name', 'Unknown')
-            plane_info = f"\nPlane: {plane_name}"
-
-        result = ui.messageBox(
-            f"Found sketch '{template_sketch.name}'{plane_info}\n\n"
-            f"Use this sketch for template export?",
-            "Template Sketch Found",
-            adsk.core.MessageBoxButtonTypes.YesNoCancelButtonType
-        )
-        if result == adsk.core.DialogResults.DialogYes:
-            return template_sketch
-        elif result == adsk.core.DialogResults.DialogCancel:
-            return None
-        # If No, fall through to manual selection
-
-    # Try to use active sketch if no auto-detect or user said No
-    active_obj = design.activeEditObject
-    if active_obj and active_obj.objectType == adsk.fusion.Sketch.classType():
-        result = ui.messageBox(
-            f"Use active sketch '{active_obj.name}'?",
-            "Select Sketch",
-            adsk.core.MessageBoxButtonTypes.YesNoCancelButtonType
-        )
-        if result == adsk.core.DialogResults.DialogYes:
-            return active_obj
-        elif result == adsk.core.DialogResults.DialogCancel:
-            return None
-
-    # Otherwise, prompt user to select manually
-    ui.messageBox(
-        f"Could not find sketch named '{TEMPLATE_SKETCH_NAME}'"
-        + (f" on plane '{MIDPLANE_NAME}'" if MIDPLANE_NAME else "")
-        + ".\n\nPlease select the sketch manually.",
-        "Manual Selection Required"
-    )
-    selection = ui.selectEntity(
-        "Select the sketch containing the ring profile points",
-        "Sketches"
-    )
-    if selection:
-        return selection.entity
+        for plane in comp.constructionPlanes:
+            if plane.name.lower() == plane_name_lower:
+                return plane
+    
+    # Also check root component's origin planes
+    root_comp = design.rootComponent
+    for plane in root_comp.originConstructionPlanes:
+        if plane.name.lower() == plane_name_lower:
+            return plane
+    
     return None
 
 
-def extract_nodes_from_sketch(sketch):
-    """Extract all sketch points as node records.
-
-    Points are numbered by their creation order in the sketch.
-    Coordinates are converted to mm and mapped to X-Z plane (Y=0).
-
-    Filters out:
-    - Origin point (0,0,0)
-    - Circle/arc center points (geometric construction points)
-    - Duplicate coordinates (within tolerance)
-
+def create_intersection_sketch(component, plane, body):
+    """Create a sketch with the body's intersection on the plane.
+    
+    Parameters
+    ----------
+    component : adsk.fusion.Component
+        The component to create the sketch in
+    plane : adsk.fusion.ConstructionPlane
+        The plane to create the sketch on
+    body : adsk.fusion.BRepBody
+        The body to intersect with the plane
+        
     Returns
     -------
     tuple
-        (nodes, filter_stats) where filter_stats is a dict with counts
-        of skipped points by reason.
+        (sketch, created_new) where sketch is the created sketch and
+        created_new indicates if a new sketch was created
     """
-
-    # Build set of center points to exclude (circle/arc centers)
-    # These are automatically created when drawing circles/arcs and
-    # are not explicitly placed points
-    center_points = set()
-
-    # Collect circle center points
-    for circle in sketch.sketchCurves.sketchCircles:
-        center_points.add(circle.centerSketchPoint)
-
-    # Collect arc center points
-    for arc in sketch.sketchCurves.sketchArcs:
-        center_points.add(arc.centerSketchPoint)
-
-    # Collect ellipse center points
-    for ellipse in sketch.sketchCurves.sketchEllipses:
-        center_points.add(ellipse.centerSketchPoint)
-
-    # Collect elliptical arc center points
-    for elliptical_arc in sketch.sketchCurves.sketchEllipticalArcs:
-        center_points.add(elliptical_arc.centerSketchPoint)
-
-    nodes = []
-    node_id = 1
-    seen_coords = []  # List of (x, z) tuples for duplicate detection
-    tolerance = 1e-6  # Coordinate tolerance for duplicate detection (mm)
-
-    filter_stats = {
-        "skipped_origin": 0,
-        "skipped_centers": 0,
-        "skipped_duplicates": 0,
-        "total_examined": 0,
-    }
-
-    # Get all sketch points, filtering out unwanted ones
-    for point in sketch.sketchPoints:
-        filter_stats["total_examined"] += 1
-
-        # Skip the origin reference point
-        if point.geometry.isEqualTo(adsk.core.Point3D.create(0, 0, 0)):
-            filter_stats["skipped_origin"] += 1
-            continue
-
-        # Skip circle/arc/ellipse center points (construction geometry)
-        if point in center_points:
-            filter_stats["skipped_centers"] += 1
-            continue
-
-        geo = point.geometry
-
-        # Convert coordinates based on Fusion document units
-        # Map Fusion XY to template XZ (profile in XZ plane, Y=0)
-        scale = 10.0 if FUSION_UNITS == "cm" else 1.0  # cm->mm or mm->mm
-        x = round(geo.x * scale, 9)
-        z = round(geo.y * scale, 9)  # Fusion Y -> Template Z
-
-        # Check for duplicate coordinates (within tolerance)
-        is_duplicate = False
-        for seen_x, seen_z in seen_coords:
-            if abs(x - seen_x) < tolerance and abs(z - seen_z) < tolerance:
-                is_duplicate = True
-                filter_stats["skipped_duplicates"] += 1
-                break
-
-        if is_duplicate:
-            continue
-
-        seen_coords.append((x, z))
-
-        node = {
-            "id": node_id,
-            "x": x,
-            "y": 0.0,
-            "z": z
-        }
-        nodes.append(node)
-        node_id += 1
-
-    return nodes, filter_stats
-
-
-def define_elements_interactive(ui, nodes):
-    """Interactive element definition.
-
-    Prompts the user to enter element connectivity manually.
-    For production use with many elements, modify PREDEFINED_ELEMENTS instead.
+    # Create a new sketch on the plane
+    sketches = component.sketches
+    sketch = sketches.add(plane)
+    sketch.name = f"_intersection_{MIDPLANE_NAME}"
     
-    Supported element types:
-    - QUAD/QUAD4: 4 nodes (linear)
-    - QUAD8: 8 nodes (quadratic, curved edges)
-    - TRI/TRI3: 3 nodes (linear)
-    - TRI6: 6 nodes (quadratic, curved edges)
-    """
-
-    # Valid element types and their expected node counts
-    ELEMENT_TYPES = {
-        "QUAD": 4, "QUAD4": 4,
-        "QUAD8": 8,
-        "TRI": 3, "TRI3": 3,
-        "TRI6": 6,
-    }
-
-    elements = []
-    element_id = 1
-
-    # Build node list display (first 15 nodes)
-    node_display = []
-    for n in nodes[:15]:
-        node_display.append(f"  {n['id']:3d}: ({n['x']:8.4f}, {n['z']:8.4f})")
-    node_list = "\n".join(node_display)
-    if len(nodes) > 15:
-        node_list += f"\n  ... and {len(nodes) - 15} more nodes"
-
-    ui.messageBox(
-        f"Node extraction complete: {len(nodes)} nodes found.\n\n"
-        f"You will now define elements interactively.\n"
-        f"Enter empty value to finish.\n\n"
-        f"Format: TYPE,N1,N2,...\n"
-        f"  QUAD,1,2,4,3    (4 nodes, linear)\n"
-        f"  QUAD8,1,2,3,4,5,6,7,8  (8 nodes, quadratic)\n"
-        f"  TRI,5,6,7       (3 nodes, linear)\n"
-        f"  TRI6,1,2,3,4,5,6  (6 nodes, quadratic)",
-        "Element Definition"
-    )
-
-    while True:
-        # Prompt for element definition
-        result = ui.inputBox(
-            f"Element {element_id}\n\n"
-            f"Enter: TYPE,N1,N2,...\n"
-            f"(empty to finish)\n\n"
-            f"Nodes:\n{node_list}",
-            f"Element {element_id}",
-            ""
-        )
-
-        input_value, cancelled = result
-
-        if cancelled or not input_value.strip():
-            break
-
+    # Use intersectWithSketchPlane to get the cross-section
+    # This projects the intersection curves onto the sketch
+    try:
+        sketch.intersectWithSketchPlane([body])
+    except:
+        # If intersectWithSketchPlane fails, try alternative approach
+        # Project the body edges that lie on the plane
         try:
-            parts = [p.strip() for p in input_value.split(",")]
-            elem_type = parts[0].upper()
-            node_ids = [int(p) for p in parts[1:]]
+            sketch.project(body)
+        except:
+            sketch.deleteMe()
+            return None, False
+    
+    return sketch, True
 
-            if elem_type not in ELEMENT_TYPES:
-                ui.messageBox(
-                    f"Unknown element type: {elem_type}\n\n"
-                    f"Valid types: {', '.join(ELEMENT_TYPES.keys())}"
-                )
+
+def get_outer_profile(sketch):
+    """Find the outermost (largest area) profile in the sketch.
+    
+    For a ring cross-section, the outer profile is the largest closed loop.
+    
+    Parameters
+    ----------
+    sketch : adsk.fusion.Sketch
+        The sketch containing profiles
+        
+    Returns
+    -------
+    adsk.fusion.Profile or None
+        The outer profile, or None if no profiles exist
+    """
+    if sketch.profiles.count == 0:
+        return None
+    
+    if sketch.profiles.count == 1:
+        return sketch.profiles.item(0)
+    
+    # Find the profile with the largest area (outer boundary)
+    largest_profile = None
+    largest_area = 0
+    
+    for i in range(sketch.profiles.count):
+        profile = sketch.profiles.item(i)
+        try:
+            area = profile.areaProperties().area
+            if area > largest_area:
+                largest_area = area
+                largest_profile = profile
+        except:
+            # If area calculation fails, use bounding box
+            pass
+    
+    # Fallback: if area didn't work, use bounding box
+    if largest_profile is None:
+        largest_bb_area = 0
+        for i in range(sketch.profiles.count):
+            profile = sketch.profiles.item(i)
+            try:
+                bb = profile.boundingBox
+                bb_area = (bb.maxPoint.x - bb.minPoint.x) * (bb.maxPoint.y - bb.minPoint.y)
+                if bb_area > largest_bb_area:
+                    largest_bb_area = bb_area
+                    largest_profile = profile
+            except:
                 continue
-
-            expected_nodes = ELEMENT_TYPES[elem_type]
-            if len(node_ids) != expected_nodes:
-                ui.messageBox(
-                    f"{elem_type} requires {expected_nodes} nodes, got {len(node_ids)}.\n\n"
-                    f"Format: {elem_type},n1,n2,...,n{expected_nodes}"
-                )
-                continue
-
-            # Normalize type names (QUAD4->QUAD, TRI3->TRI, etc.)
-            normalized_type = elem_type
-            if elem_type == "QUAD4":
-                normalized_type = "QUAD"
-            elif elem_type == "TRI3":
-                normalized_type = "TRI"
-
-            elements.append({
-                "id": element_id,
-                "type": normalized_type,
-                "nodes": node_ids
-            })
-            element_id += 1
-
-        except Exception as e:
-            ui.messageBox(f"Could not parse element definition:\n{e}")
-
-    return elements
+    
+    return largest_profile if largest_profile else sketch.profiles.item(0)
 
 
-def build_template_json(nodes, elements, surfaces):
-    """Construct the complete JSON template structure."""
+def extract_boundary_curves(profile, sketch):
+    """Extract curves from a profile's outer loop.
+    
+    Parameters
+    ----------
+    profile : adsk.fusion.Profile
+        The profile to extract curves from
+    sketch : adsk.fusion.Sketch
+        The sketch containing the profile
+        
+    Returns
+    -------
+    list
+        List of curve dictionaries with type and coordinates
+    """
+    curves = []
+    scale = 10.0 if FUSION_UNITS == "cm" else 1.0
+    
+    # Get the outer loop of the profile
+    outer_loop = None
+    for loop in profile.profileLoops:
+        if loop.isOuter:
+            outer_loop = loop
+            break
+    
+    # If no explicit outer loop, use the first one
+    if outer_loop is None and profile.profileLoops.count > 0:
+        outer_loop = profile.profileLoops.item(0)
+    
+    if outer_loop is None:
+        return curves
+    
+    # Extract each curve in the loop
+    for profile_curve in outer_loop.profileCurves:
+        curve_geo = profile_curve.geometry
+        curve_data = extract_curve_geometry(curve_geo, scale)
+        if curve_data:
+            curves.append(curve_data)
+    
+    return curves
 
-    # Auto-calculate base height from nodes if not specified
-    if BASE_HEIGHT_MM is None and nodes:
-        z_coords = [n["z"] for n in nodes]
-        base_height = max(z_coords) - min(z_coords)
-    else:
-        base_height = BASE_HEIGHT_MM or 0.0
 
+def extract_curve_geometry(curve_geo, scale):
+    """Extract geometry data from a curve.
+    
+    Parameters
+    ----------
+    curve_geo : adsk.core.Curve3D
+        The curve geometry to extract
+    scale : float
+        Scale factor to convert to mm
+        
+    Returns
+    -------
+    dict or None
+        Curve data dictionary, or None if extraction failed
+    """
+    curve_type = curve_geo.curveType
+    
+    # Line segment
+    if curve_type == adsk.core.Curve3DTypes.Line3DCurveType:
+        line = adsk.core.Line3D.cast(curve_geo)
+        if line:
+            # Get start and end points
+            start = line.startPoint
+            end = line.endPoint
+            return {
+                "type": "line",
+                "start": [round(start.x * scale, 9), round(start.y * scale, 9)],
+                "end": [round(end.x * scale, 9), round(end.y * scale, 9)]
+            }
+    
+    # Circular arc
+    elif curve_type == adsk.core.Curve3DTypes.Arc3DCurveType:
+        arc = adsk.core.Arc3D.cast(curve_geo)
+        if arc:
+            center = arc.center
+            radius = arc.radius * scale
+            start = arc.startPoint
+            end = arc.endPoint
+            
+            # Calculate angles
+            start_angle = math.atan2(start.y - center.y, start.x - center.x)
+            end_angle = math.atan2(end.y - center.y, end.x - center.x)
+            
+            return {
+                "type": "arc",
+                "center": [round(center.x * scale, 9), round(center.y * scale, 9)],
+                "radius": round(radius, 9),
+                "start_angle": round(start_angle, 9),
+                "end_angle": round(end_angle, 9),
+                "start": [round(start.x * scale, 9), round(start.y * scale, 9)],
+                "end": [round(end.x * scale, 9), round(end.y * scale, 9)]
+            }
+    
+    # Circle (full circle)
+    elif curve_type == adsk.core.Curve3DTypes.Circle3DCurveType:
+        circle = adsk.core.Circle3D.cast(curve_geo)
+        if circle:
+            center = circle.center
+            radius = circle.radius * scale
+            return {
+                "type": "arc",
+                "center": [round(center.x * scale, 9), round(center.y * scale, 9)],
+                "radius": round(radius, 9),
+                "start_angle": 0,
+                "end_angle": 2 * math.pi,
+                "start": [round((center.x + circle.radius) * scale, 9), round(center.y * scale, 9)],
+                "end": [round((center.x + circle.radius) * scale, 9), round(center.y * scale, 9)]
+            }
+    
+    # Ellipse or elliptical arc
+    elif curve_type in [adsk.core.Curve3DTypes.Ellipse3DCurveType, 
+                        adsk.core.Curve3DTypes.EllipticalArc3DCurveType]:
+        # Convert ellipse to spline points for GMSH compatibility
+        evaluator = curve_geo.evaluator
+        success, start_param, end_param = evaluator.getParameterExtents()
+        if success:
+            points = sample_curve_points(evaluator, start_param, end_param, scale, num_points=20)
+            if points:
+                return {
+                    "type": "spline",
+                    "points": points,
+                    "degree": 3
+                }
+    
+    # NURBS curve or spline
+    elif curve_type == adsk.core.Curve3DTypes.NurbsCurve3DCurveType:
+        nurbs = adsk.core.NurbsCurve3D.cast(curve_geo)
+        if nurbs:
+            evaluator = nurbs.evaluator
+            success, start_param, end_param = evaluator.getParameterExtents()
+            if success:
+                # Sample points along the spline
+                points = sample_curve_points(evaluator, start_param, end_param, scale, num_points=20)
+                if points:
+                    return {
+                        "type": "spline",
+                        "points": points,
+                        "degree": min(nurbs.degree, 3)  # GMSH typically uses degree 3 max
+                    }
+    
+    # Fallback: sample any curve type
+    try:
+        evaluator = curve_geo.evaluator
+        success, start_param, end_param = evaluator.getParameterExtents()
+        if success:
+            points = sample_curve_points(evaluator, start_param, end_param, scale, num_points=20)
+            if points:
+                return {
+                    "type": "spline",
+                    "points": points,
+                    "degree": 3
+                }
+    except:
+        pass
+    
+    return None
+
+
+def sample_curve_points(evaluator, start_param, end_param, scale, num_points=20):
+    """Sample points along a curve.
+    
+    Parameters
+    ----------
+    evaluator : adsk.core.CurveEvaluator3D
+        The curve evaluator
+    start_param : float
+        Start parameter
+    end_param : float
+        End parameter
+    scale : float
+        Scale factor to convert to mm
+    num_points : int
+        Number of points to sample
+        
+    Returns
+    -------
+    list
+        List of [x, z] coordinate pairs
+    """
+    points = []
+    for i in range(num_points):
+        t = start_param + (end_param - start_param) * i / (num_points - 1)
+        success, point = evaluator.getPointAtParameter(t)
+        if success:
+            # Map Fusion XY to template XZ
+            x = round(point.x * scale, 9)
+            z = round(point.y * scale, 9)  # Fusion Y -> Template Z
+            points.append([x, z])
+    return points
+
+
+def extract_boundary_vertices(profile, sketch):
+    """Extract vertex positions from the profile boundary.
+    
+    Parameters
+    ----------
+    profile : adsk.fusion.Profile
+        The profile to extract vertices from
+    sketch : adsk.fusion.Sketch
+        The sketch containing the profile
+        
+    Returns
+    -------
+    list
+        List of vertex dictionaries with x, z coordinates
+    """
+    vertices = []
+    seen_coords = set()
+    scale = 10.0 if FUSION_UNITS == "cm" else 1.0
+    tolerance = 1e-6
+    
+    # Get the outer loop of the profile
+    outer_loop = None
+    for loop in profile.profileLoops:
+        if loop.isOuter:
+            outer_loop = loop
+            break
+    
+    if outer_loop is None and profile.profileLoops.count > 0:
+        outer_loop = profile.profileLoops.item(0)
+    
+    if outer_loop is None:
+        return vertices
+    
+    # Extract vertices from curve endpoints
+    for profile_curve in outer_loop.profileCurves:
+        sketch_entity = profile_curve.sketchEntity
+        
+        # Try to get start and end points
+        start_point = None
+        end_point = None
+        
+        if hasattr(sketch_entity, 'startSketchPoint'):
+            start_point = sketch_entity.startSketchPoint
+        if hasattr(sketch_entity, 'endSketchPoint'):
+            end_point = sketch_entity.endSketchPoint
+        
+        for point in [start_point, end_point]:
+            if point:
+                geo = point.geometry
+                x = round(geo.x * scale, 9)
+                z = round(geo.y * scale, 9)  # Fusion Y -> Template Z
+                
+                # Check for duplicates
+                coord_key = (round(x / tolerance) * tolerance, 
+                           round(z / tolerance) * tolerance)
+                if coord_key not in seen_coords:
+                    seen_coords.add(coord_key)
+                    vertices.append({"x": x, "z": z})
+    
+    return vertices
+
+
+def build_boundary_json(curves, vertices):
+    """Build the boundary JSON structure.
+    
+    Parameters
+    ----------
+    curves : list
+        List of curve dictionaries
+    vertices : list
+        List of vertex dictionaries
+        
+    Returns
+    -------
+    dict
+        Complete boundary JSON structure
+    """
     return {
         "name": TEMPLATE_NAME,
         "version": "1.0",
         "units": "mm",
-        "profile_plane": "XZ",
-        "base_height_mm": round(base_height, 6),
-
+        "plane": MIDPLANE_NAME,
+        
         "metadata": {
             "author": os.getenv("USERNAME", os.getenv("USER", "Unknown")),
             "created": datetime.now().strftime("%Y-%m-%d"),
-            "source": "Fusion 360 export",
-            "description": f"{TEMPLATE_NAME} - 2D cross-section profile for revolution",
-            "notes": "Auto-generated from Fusion 360 sketch"
+            "source": "Fusion 360 body intersection",
+            "description": f"{TEMPLATE_NAME} - boundary profile for GMSH meshing"
         },
-
-        "nodes": nodes,
-        "elements": elements,
-        "boundary_nodes": {k: v for k, v in BOUNDARY_NODES.items() if v is not None},
-        "surfaces": surfaces
+        
+        "boundary": {
+            "curves": curves,
+            "vertices": vertices
+        }
     }
 
 
 def get_output_path(ui):
-    """Prompt user for output file location."""
-
+    """Prompt user for output file location.
+    
+    Defaults to the boundaries/ folder in the project.
+    
+    Parameters
+    ----------
+    ui : adsk.core.UserInterface
+        The Fusion 360 user interface
+        
+    Returns
+    -------
+    str or None
+        Selected file path, or None if cancelled
+    """
     dialog = ui.createFileDialog()
-    dialog.title = "Save Ring Template JSON"
+    dialog.title = "Save Boundary Profile JSON"
     dialog.filter = "JSON Files (*.json)"
     dialog.filterIndex = 0
     dialog.initialFilename = OUTPUT_FILENAME
+    
+    # Set initial directory to boundaries folder
+    if os.path.isdir(BOUNDARIES_FOLDER):
+        dialog.initialDirectory = BOUNDARIES_FOLDER
+    else:
+        # Create the folder if it doesn't exist
+        try:
+            os.makedirs(BOUNDARIES_FOLDER, exist_ok=True)
+            dialog.initialDirectory = BOUNDARIES_FOLDER
+        except:
+            pass  # Fall back to default directory
 
     if dialog.showSave() == adsk.core.DialogResults.DialogOK:
         return dialog.filename

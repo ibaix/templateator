@@ -1,0 +1,7 @@
+# Templateator - 2D Mesh Template Generator
+# Install with: pip install -r requirements.txt
+
+# Core dependencies
+gmsh>=4.11.0          # Mesh generation
+matplotlib>=3.5.0     # Visualization
+numpy>=1.21.0         # Numerical operations
