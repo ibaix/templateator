@@ -2,19 +2,34 @@
 GMSH Mesh Generator for Ring Templates
 
 Reads a boundary JSON file exported from Fusion 360 and generates
-a structured quad mesh using GMSH.
+a high-quality quad mesh using GMSH with aggressive optimization.
 
 Usage (from project root):
     python scripts/mesh_with_gmsh.py boundaries/boundary.json -o output_templates/template.json
-    python scripts/mesh_with_gmsh.py boundaries/boundary.json -o output_templates/template.json -n 10
+    python scripts/mesh_with_gmsh.py boundaries/boundary.json -o output_templates/template.json -n 20
     python scripts/mesh_with_gmsh.py boundaries/boundary.json --preview
+    
+    # High quality mesh (recommended for FEM):
+    python scripts/mesh_with_gmsh.py boundaries/boundary.json -q
+    
+    # Maximum quality for critical simulations:
+    python scripts/mesh_with_gmsh.py boundaries/boundary.json -n 30 -q --min-quality 0.6 --optimize-iter 30
 
 Options:
-    -o, --output    Output template JSON file (default: output_templates/template.json)
-    -n, --divisions Number of mesh divisions per edge (default: 5)
-    -q, --quality   Enable mesh quality optimization
-    --preview       Show mesh in GMSH GUI before saving
-    --element-size  Target element size in mm (alternative to divisions)
+    -o, --output      Output template JSON file (default: output_templates/template.json)
+    -n, --divisions   Number of mesh divisions per edge (default: 10)
+    -q, --quality     Enable aggressive quality optimization (multiple smoothing passes)
+    --min-quality     Minimum quality for quad recombination (0-1, default: 0.5)
+                      Higher values prevent degenerate quads but may leave more triangles
+    --optimize-iter   Number of optimization passes when -q is used (default: 15)
+    --preview         Show mesh in GMSH GUI before saving
+    --element-size    Target element size in mm (alternative to divisions)
+
+Quality Metrics:
+    The script reports mesh quality including:
+    - Angle range: internal angles of quad elements (ideal: 90°, acceptable: 60°-120°)
+    - Quality score: 0-1 metric based on angles and aspect ratio
+    - Poor elements: quads with angles >150° or <30° (problematic for FEM)
 """
 
 import argparse
@@ -168,8 +183,9 @@ def create_gmsh_geometry(boundary: dict) -> Tuple[int, List[int]]:
 
 
 def configure_quad_mesh(surface_tag: int, curve_tags: List[int], 
-                        divisions: int = 5, element_size: Optional[float] = None):
-    """Configure GMSH for quad meshing.
+                        divisions: int = 5, element_size: Optional[float] = None,
+                        min_quality: float = 0.5, num_threads: int = 0):
+    """Configure GMSH for quad meshing with high-performance settings.
     
     Uses transfinite meshing for simple 3-4 sided surfaces,
     otherwise uses unstructured quad meshing with recombination.
@@ -184,16 +200,44 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
         Number of divisions per edge
     element_size : float, optional
         Target element size (overrides divisions if set)
+    min_quality : float
+        Minimum element quality threshold (0-1, default 0.5)
+    num_threads : int
+        Number of CPU threads (0 = auto-detect)
     """
     # Synchronize geometry
     gmsh.model.geo.synchronize()
     
-    # Set mesh options for quads
+    # === PARALLELIZATION SETTINGS ===
+    # Enable multi-threading for meshing operations
+    if num_threads > 0:
+        gmsh.option.setNumber("General.NumThreads", num_threads)
+        gmsh.option.setNumber("Mesh.MaxNumThreads2D", num_threads)
+    
+    # === MESH ALGORITHM SETTINGS ===
     gmsh.option.setNumber("Mesh.RecombineAll", 1)
     gmsh.option.setNumber("Mesh.Algorithm", 8)  # Frontal-Delaunay for quads
-    gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 1)  # Blossom
+    gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 1)  # 1 = Blossom (robust for unstructured)
     gmsh.option.setNumber("Mesh.ElementOrder", 1)  # Linear elements
     gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)
+    
+    # Blossom-specific optimizations
+    gmsh.option.setNumber("Mesh.RecombineNodeRepositioning", 1)  # Allow node movement during recombination
+    
+    # === QUALITY CONTROLS ===
+    # These help prevent degenerate quads with angles near 180°
+    gmsh.option.setNumber("Mesh.RecombineMinimumQuality", min_quality)
+    gmsh.option.setNumber("Mesh.RecombineOptimizeTopology", 1)
+    
+    # More aggressive quality thresholds
+    gmsh.option.setNumber("Mesh.QualityType", 2)  # SICN (signed inverse condition number) - best for FEM
+    gmsh.option.setNumber("Mesh.OptimizeThreshold", 0.3)  # Optimize elements below this quality
+    
+    # === SMOOTHING SETTINGS ===
+    # High iteration count for powerful CPUs
+    gmsh.option.setNumber("Mesh.Smoothing", 500)  # Number of smoothing steps
+    gmsh.option.setNumber("Mesh.SmoothRatio", 2.0)  # Max ratio for smoothing
+    gmsh.option.setNumber("Mesh.SmoothNormals", 1)  # Smooth normals for better quality
     
     # Calculate mesh size from boundary if not specified
     if element_size is None:
@@ -241,6 +285,123 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
                 gmsh.model.mesh.setTransfiniteCurve(curve_tag, divisions + 1)
             except:
                 pass
+
+
+def compute_element_quality(nodes: List[dict], elements: List[dict]) -> dict:
+    """Compute quality metrics for all elements.
+    
+    Calculates:
+    - Internal angles (min, max per element)
+    - Aspect ratio
+    - Jacobian-based quality metric
+    
+    Parameters
+    ----------
+    nodes : list
+        List of node dictionaries
+    elements : list
+        List of element dictionaries
+        
+    Returns
+    -------
+    dict
+        Quality statistics and list of poor quality elements
+    """
+    node_map = {n["id"]: (n["x"], n["z"]) for n in nodes}
+    
+    all_min_angles = []
+    all_max_angles = []
+    all_jacobians = []
+    poor_elements = []  # Elements with quality issues
+    
+    for elem in elements:
+        if elem["type"] != "QUAD":
+            continue
+            
+        node_ids = elem["nodes"]
+        if len(node_ids) < 4:
+            continue
+            
+        # Get coordinates
+        coords = [node_map.get(nid, (0, 0)) for nid in node_ids]
+        
+        # Calculate internal angles at each corner
+        angles = []
+        for i in range(4):
+            p_prev = coords[(i - 1) % 4]
+            p_curr = coords[i]
+            p_next = coords[(i + 1) % 4]
+            
+            # Vectors from current to prev and next
+            v1 = (p_prev[0] - p_curr[0], p_prev[1] - p_curr[1])
+            v2 = (p_next[0] - p_curr[0], p_next[1] - p_curr[1])
+            
+            # Magnitudes
+            mag1 = math.sqrt(v1[0]**2 + v1[1]**2)
+            mag2 = math.sqrt(v2[0]**2 + v2[1]**2)
+            
+            if mag1 < 1e-10 or mag2 < 1e-10:
+                angles.append(180.0)  # Degenerate
+                continue
+            
+            # Dot product and angle
+            dot = v1[0] * v2[0] + v1[1] * v2[1]
+            cos_angle = max(-1.0, min(1.0, dot / (mag1 * mag2)))
+            angle_deg = math.degrees(math.acos(cos_angle))
+            angles.append(angle_deg)
+        
+        min_angle = min(angles)
+        max_angle = max(angles)
+        all_min_angles.append(min_angle)
+        all_max_angles.append(max_angle)
+        
+        # Simplified Jacobian quality: ratio of min/max edge lengths and angle deviation
+        edges = []
+        for i in range(4):
+            p1 = coords[i]
+            p2 = coords[(i + 1) % 4]
+            edge_len = math.sqrt((p2[0] - p1[0])**2 + (p2[1] - p1[1])**2)
+            edges.append(edge_len)
+        
+        if max(edges) > 1e-10:
+            aspect_ratio = max(edges) / max(min(edges), 1e-10)
+        else:
+            aspect_ratio = 1.0
+        
+        # Quality metric: 1.0 = ideal (all 90° angles), 0.0 = worst
+        # Penalize angles far from 90° and high aspect ratios
+        angle_quality = 1.0 - (max(abs(max_angle - 90), abs(90 - min_angle)) / 90.0)
+        aspect_quality = min(1.0, 2.0 / aspect_ratio)
+        jacobian_quality = angle_quality * aspect_quality
+        all_jacobians.append(jacobian_quality)
+        
+        # Flag poor quality elements
+        if max_angle > 150 or min_angle < 30 or aspect_ratio > 5:
+            poor_elements.append({
+                "id": elem["id"],
+                "min_angle": round(min_angle, 1),
+                "max_angle": round(max_angle, 1),
+                "aspect_ratio": round(aspect_ratio, 2),
+                "quality": round(jacobian_quality, 3)
+            })
+    
+    # Compute statistics
+    stats = {}
+    if all_min_angles:
+        stats["angle_min"] = round(min(all_min_angles), 1)
+        stats["angle_max"] = round(max(all_max_angles), 1)
+        stats["angle_avg_min"] = round(sum(all_min_angles) / len(all_min_angles), 1)
+        stats["angle_avg_max"] = round(sum(all_max_angles) / len(all_max_angles), 1)
+    if all_jacobians:
+        stats["quality_min"] = round(min(all_jacobians), 3)
+        stats["quality_max"] = round(max(all_jacobians), 3)
+        stats["quality_avg"] = round(sum(all_jacobians) / len(all_jacobians), 3)
+    
+    return {
+        "statistics": stats,
+        "poor_elements": poor_elements,
+        "num_poor": len(poor_elements)
+    }
 
 
 def extract_mesh_data() -> Tuple[List[dict], List[dict]]:
@@ -490,8 +651,10 @@ def build_template(boundary: dict, nodes: List[dict], elements: List[dict]) -> d
 
 def generate_mesh(boundary_file: str, output_file: str, 
                   divisions: int = 5, element_size: Optional[float] = None,
-                  quality: bool = False, preview: bool = False) -> dict:
-    """Generate mesh from boundary file.
+                  quality: bool = False, preview: bool = False,
+                  min_quality: float = 0.5, optimize_iterations: int = 10,
+                  num_threads: int = 0) -> dict:
+    """Generate mesh from boundary file with high-performance settings.
     
     Parameters
     ----------
@@ -507,14 +670,23 @@ def generate_mesh(boundary_file: str, output_file: str,
         Enable mesh quality optimization
     preview : bool
         Show mesh in GMSH GUI before saving
+    min_quality : float
+        Minimum element quality threshold for recombination (0-1)
+    optimize_iterations : int
+        Number of optimization passes when quality=True
+    num_threads : int
+        Number of CPU threads (0 = auto-detect all cores)
         
     Returns
     -------
     dict
         Generated template data
     """
+    import time
+    start_time = time.perf_counter()
+    
     # Load boundary
-    print(f"Loading boundary: {boundary_file}")
+    print(f"Loading boundary: {boundary_file}", flush=True)
     boundary = load_boundary(boundary_file)
     
     # Initialize GMSH
@@ -527,18 +699,29 @@ def generate_mesh(boundary_file: str, output_file: str,
         surface_tag, curve_tags = create_gmsh_geometry(boundary)
         
         # Configure meshing
-        print(f"Configuring mesh (divisions={divisions})...")
-        configure_quad_mesh(surface_tag, curve_tags, divisions, element_size)
+        print(f"Configuring mesh (divisions={divisions}, min_quality={min_quality})...")
+        configure_quad_mesh(surface_tag, curve_tags, divisions, element_size, min_quality, num_threads)
         
         # Generate mesh
-        print("Generating mesh...")
+        print("Generating mesh...", flush=True)
+        mesh_start = time.perf_counter()
         gmsh.model.mesh.generate(2)
+        mesh_time = time.perf_counter() - mesh_start
+        print(f"  Mesh generation: {mesh_time:.3f}s", flush=True)
         
         # Optimize if requested
         if quality:
-            print("Optimizing mesh quality...")
-            gmsh.model.mesh.optimize("Laplace2D")
-            gmsh.model.mesh.optimize("Relocate2D")
+            print(f"Optimizing mesh quality ({optimize_iterations} iterations)...", flush=True)
+            opt_start = time.perf_counter()
+            
+            for i in range(optimize_iterations):
+                # Laplace smoothing - moves nodes to improve element quality
+                gmsh.model.mesh.optimize("Laplace2D")
+                # Relocate - more aggressive node relocation  
+                gmsh.model.mesh.optimize("Relocate2D")
+            
+            opt_time = time.perf_counter() - opt_start
+            print(f"  Optimization: {opt_time:.3f}s ({optimize_iterations} iterations)", flush=True)
         
         # Preview if requested
         if preview:
@@ -546,27 +729,74 @@ def generate_mesh(boundary_file: str, output_file: str,
             gmsh.fltk.run()
         
         # Extract mesh data
-        print("Extracting mesh data...")
-        nodes, elements = extract_mesh_data()
+        print("Extracting mesh data...", flush=True)
+        try:
+            nodes, elements = extract_mesh_data()
+        except Exception as e:
+            print(f"Error extracting mesh data: {e}", flush=True)
+            raise
+        
+        # Compute and report quality metrics
+        print("\nAnalyzing mesh quality...", flush=True)
+        try:
+            quality_data = compute_element_quality(nodes, elements)
+            stats = quality_data["statistics"]
+        except Exception as e:
+            print(f"Error computing quality: {e}", flush=True)
+            quality_data = {"statistics": {}, "poor_elements": [], "num_poor": 0}
+            stats = {}
+        
+        if stats:
+            print(f"  Angle range: {stats.get('angle_min', 'N/A')}° - {stats.get('angle_max', 'N/A')}°")
+            print(f"  Avg angles: min={stats.get('angle_avg_min', 'N/A')}°, max={stats.get('angle_avg_max', 'N/A')}°")
+            print(f"  Quality: min={stats.get('quality_min', 'N/A')}, avg={stats.get('quality_avg', 'N/A')}, max={stats.get('quality_max', 'N/A')}")
+            
+            if quality_data["num_poor"] > 0:
+                print(f"\n  WARNING: {quality_data['num_poor']} elements with poor quality detected!")
+                print(f"  (angles >150° or <30°, or aspect ratio >5)")
+                # Show up to 5 worst elements
+                worst = sorted(quality_data["poor_elements"], key=lambda x: x["quality"])[:5]
+                for elem in worst:
+                    print(f"    Element {elem['id']}: angles={elem['min_angle']}°-{elem['max_angle']}°, "
+                          f"aspect={elem['aspect_ratio']}, quality={elem['quality']}")
         
         # Build template
         template = build_template(boundary, nodes, elements)
         
+        # Add quality metrics to template metadata
+        template["metadata"]["mesh_quality"] = stats
+        if quality_data["num_poor"] > 0:
+            template["metadata"]["poor_quality_elements"] = quality_data["num_poor"]
+        
         # Save template
-        print(f"Saving template: {output_file}")
+        print(f"\nSaving template: {output_file}", flush=True)
         save_template(template, output_file)
+        print("Template saved successfully.", flush=True)
         
         # Summary
+        total_time = time.perf_counter() - start_time
         quad_count = sum(1 for e in elements if e["type"] == "QUAD")
         tri_count = sum(1 for e in elements if e["type"] == "TRI")
         
-        print(f"\nMesh generation complete!")
+        print(f"\n{'='*50}")
+        print(f"MESH GENERATION COMPLETE")
+        print(f"{'='*50}")
         print(f"  Nodes: {len(nodes)}")
         print(f"  Elements: {len(elements)}")
         print(f"    - Quads: {quad_count}")
         print(f"    - Tris: {tri_count}")
         print(f"  Base height: {template['base_height_mm']:.4f} mm")
+        print(f"  Total time: {total_time:.3f}s")
         print(f"\nOutput saved to: {output_file}")
+        
+        # Recommendations for poor quality meshes
+        if quality_data["num_poor"] > 0:
+            print("\n--- RECOMMENDATIONS ---")
+            print("To improve mesh quality, try:")
+            print("  1. Use -q flag for quality optimization")
+            print("  2. Increase --min-quality threshold (e.g., 0.6)")
+            print("  3. Increase --optimize-iter (e.g., 20)")
+            print("  4. Increase divisions (-n) for finer mesh")
         
         return template
         
@@ -576,14 +806,19 @@ def generate_mesh(boundary_file: str, output_file: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate structured quad mesh from Fusion 360 boundary export",
+        description="Generate high-quality quad mesh from Fusion 360 boundary export",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples (from project root):
   python scripts/mesh_with_gmsh.py boundaries/boundary.json -o output_templates/template.json
-  python scripts/mesh_with_gmsh.py boundaries/boundary.json -o output_templates/template.json -n 10
+  python scripts/mesh_with_gmsh.py boundaries/boundary.json -o output_templates/template.json -n 20
   python scripts/mesh_with_gmsh.py boundaries/boundary.json --preview
-  python scripts/mesh_with_gmsh.py boundaries/boundary.json --element-size 0.02
+  
+  # High quality mesh with optimization (recommended):
+  python scripts/mesh_with_gmsh.py boundaries/boundary.json -q
+  
+  # Maximum quality for critical simulations:
+  python scripts/mesh_with_gmsh.py boundaries/boundary.json -n 30 -q --min-quality 0.6 --optimize-iter 30
         """
     )
     
@@ -593,14 +828,24 @@ Examples (from project root):
                         default="output_templates/template.json",
                         help="Output template JSON file (default: output_templates/template.json)")
     parser.add_argument("-n", "--divisions", 
-                        type=int, default=5,
-                        help="Number of mesh divisions per edge (default: 5)")
+                        type=int, default=10,
+                        help="Number of mesh divisions per edge (default: 10)")
     parser.add_argument("--element-size", 
                         type=float, default=None,
                         help="Target element size in mm (overrides --divisions)")
     parser.add_argument("-q", "--quality", 
                         action="store_true",
-                        help="Enable mesh quality optimization")
+                        help="Enable aggressive quality optimization (multiple Laplace + Relocate passes)")
+    parser.add_argument("--min-quality",
+                        type=float, default=0.5,
+                        help="Minimum quality threshold for quad recombination (0-1, default: 0.5). "
+                             "Higher values prevent degenerate quads but may leave more triangles.")
+    parser.add_argument("--optimize-iter",
+                        type=int, default=40,
+                        help="Number of optimization iterations when -q is used (default: 15)")
+    parser.add_argument("--threads",
+                        type=int, default=0,
+                        help="Number of CPU threads (default: 0 = use GMSH default)")
     parser.add_argument("--preview", 
                         action="store_true",
                         help="Show mesh in GMSH GUI before saving")
@@ -624,7 +869,10 @@ Examples (from project root):
             divisions=args.divisions,
             element_size=args.element_size,
             quality=args.quality,
-            preview=args.preview
+            preview=args.preview,
+            min_quality=args.min_quality,
+            optimize_iterations=args.optimize_iter,
+            num_threads=args.threads
         )
     except Exception as e:
         print(f"Error: {e}")
