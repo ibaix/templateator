@@ -5,7 +5,7 @@
   "plane": "midplane_real",
   "metadata": {
     "author": "IbaiGomez",
-    "created": "2026-01-20",
+    "created": "2026-01-28",
     "source": "Fusion 360 body intersection",
     "description": "ring_150_boundary - boundary profile for GMSH meshing"
   },

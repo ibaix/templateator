@@ -1,8 +1,19 @@
 """
-GMSH Mesh Generator for Ring Templates
+GMSH Mesh Generator for Ring Templates (100% Quad Output)
 
 Reads a boundary JSON file exported from Fusion 360 and generates
-a high-quality quad mesh using GMSH with aggressive optimization.
+a guaranteed 100% quad mesh using GMSH's "All-Quads Subdivision" strategy.
+
+This approach ensures 0 triangles in output, so downstream 3D extrusion
+produces pure Hex8 elements for FEBio (no Tetrahedra or Wedges).
+
+Strategy:
+    Instead of recombining triangles into quads (which can leave residual triangles),
+    this script:
+    1. Generates a pure triangular mesh using Frontal 2D algorithm
+    2. Subdivides each triangle into 3 quads mathematically
+    
+    The subdivision is topologically guaranteed to produce only quads.
 
 Usage (from project root):
     python scripts/mesh_with_gmsh.py boundaries/boundary.json -o output_templates/template.json
@@ -13,15 +24,13 @@ Usage (from project root):
     python scripts/mesh_with_gmsh.py boundaries/boundary.json -q
     
     # Maximum quality for critical simulations:
-    python scripts/mesh_with_gmsh.py boundaries/boundary.json -n 30 -q --min-quality 0.6 --optimize-iter 30
+    python scripts/mesh_with_gmsh.py boundaries/boundary.json -n 30 -q --optimize-iter 30
 
 Options:
     -o, --output      Output template JSON file (default: output_templates/template.json)
     -n, --divisions   Number of mesh divisions per edge (default: 10)
     -q, --quality     Enable aggressive quality optimization (multiple smoothing passes)
-    --min-quality     Minimum quality for quad recombination (0-1, default: 0.5)
-                      Higher values prevent degenerate quads but may leave more triangles
-    --optimize-iter   Number of optimization passes when -q is used (default: 15)
+    --optimize-iter   Number of optimization passes when -q is used (default: 40)
     --preview         Show mesh in GMSH GUI before saving
     --element-size    Target element size in mm (alternative to divisions)
 
@@ -182,13 +191,69 @@ def create_gmsh_geometry(boundary: dict) -> Tuple[int, List[int]]:
     return surface_tag, curve_tags
 
 
+def compute_curve_length(curve_tag: int, num_samples: int = 50) -> float:
+    """Compute the length of a curve by sampling points along it.
+    
+    Works with the built-in geo kernel (unlike getMass which requires occ).
+    
+    Parameters
+    ----------
+    curve_tag : int
+        GMSH curve tag
+    num_samples : int
+        Number of sample points for length estimation (more = more accurate)
+        
+    Returns
+    -------
+    float
+        Approximate curve length
+    """
+    try:
+        # Get parametric bounds of the curve
+        # Returns (min_array, max_array) - for 1D curves, each has 1 element
+        bounds = gmsh.model.getParametrizationBounds(1, curve_tag)
+        t_min = bounds[0][0]  # First element of min_array
+        t_max = bounds[1][0]  # First element of max_array
+        
+        # Sample points along the curve
+        total_length = 0.0
+        prev_point = None
+        
+        for i in range(num_samples + 1):
+            t = t_min + (t_max - t_min) * i / num_samples
+            # getValue returns [x, y, z] for the point at parameter t
+            point = gmsh.model.getValue(1, curve_tag, [t])
+            
+            if prev_point is not None:
+                # Calculate distance between consecutive points
+                dx = point[0] - prev_point[0]
+                dy = point[1] - prev_point[1]
+                dz = point[2] - prev_point[2]
+                total_length += math.sqrt(dx*dx + dy*dy + dz*dz)
+            
+            prev_point = point
+        
+        return total_length
+    except Exception as e:
+        raise RuntimeError(f"Failed to compute curve length: {e}")
+
+
 def configure_quad_mesh(surface_tag: int, curve_tags: List[int], 
                         divisions: int = 5, element_size: Optional[float] = None,
-                        min_quality: float = 0.5, num_threads: int = 0):
-    """Configure GMSH for quad meshing with high-performance settings.
+                        num_threads: int = 0, force_adaptive: bool = False):
+    """Configure GMSH for 100% quad meshing using subdivision strategy.
     
-    Uses transfinite meshing for simple 3-4 sided surfaces,
-    otherwise uses unstructured quad meshing with recombination.
+    Instead of recombining triangles into quads (which can leave residual triangles),
+    this uses the "All-Quads Subdivision" approach:
+    1. Generate a pure triangular mesh using Delaunay algorithm
+    2. Subdivide each triangle into 3 quads mathematically
+    
+    This guarantees 100% quad output with no residual triangles, ensuring
+    downstream 3D extrusion produces pure Hex8 elements.
+    
+    For non-transfinite surfaces, uses adaptive curve discretization based on
+    actual curve lengths to ensure uniform element sizes across edges of
+    different lengths (prevents microscopic elements on short edges like fillets).
     
     Parameters
     ----------
@@ -197,15 +262,16 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
     curve_tags : list
         List of curve tags in the boundary
     divisions : int
-        Number of divisions per edge
+        Number of divisions per edge (used for transfinite meshing only)
     element_size : float, optional
         Target element size (overrides divisions if set)
-    min_quality : float
-        Minimum element quality threshold (0-1, default 0.5)
     num_threads : int
         Number of CPU threads (0 = auto-detect)
+    force_adaptive : bool
+        If True, force adaptive discretization even for 3 or 4-sided shapes.
+        Useful when edges have very different lengths (e.g. ring profiles).
     """
-    # Synchronize geometry
+    # Synchronize geometry (required before getMass and other queries)
     gmsh.model.geo.synchronize()
     
     # === PARALLELIZATION SETTINGS ===
@@ -214,77 +280,113 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
         gmsh.option.setNumber("General.NumThreads", num_threads)
         gmsh.option.setNumber("Mesh.MaxNumThreads2D", num_threads)
     
-    # === MESH ALGORITHM SETTINGS ===
-    gmsh.option.setNumber("Mesh.RecombineAll", 1)
-    gmsh.option.setNumber("Mesh.Algorithm", 8)  # Frontal-Delaunay for quads
-    gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 1)  # 1 = Blossom (robust for unstructured)
+    # === MESH ALGORITHM SETTINGS (All-Quads Subdivision Strategy) ===
+    # Step 1: Generate triangular mesh using Delaunay algorithm
+    # Delaunay (5) handles non-symmetric shapes better than Frontal 2D (6)
+    gmsh.option.setNumber("Mesh.Algorithm", 5)  # Delaunay
+    
+    # Step 2: Disable recombination (we use subdivision instead)
+    gmsh.option.setNumber("Mesh.RecombineAll", 0)
+    
+    # Step 3: Enable All-Quads subdivision
+    # SubdivisionAlgorithm = 1 splits each triangle into 3 quads
+    gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)  # All Quads
+    
     gmsh.option.setNumber("Mesh.ElementOrder", 1)  # Linear elements
     gmsh.option.setNumber("Mesh.SecondOrderLinear", 0)
     
-    # Blossom-specific optimizations
-    gmsh.option.setNumber("Mesh.RecombineNodeRepositioning", 1)  # Allow node movement during recombination
-    
-    # === QUALITY CONTROLS ===
-    # These help prevent degenerate quads with angles near 180°
-    gmsh.option.setNumber("Mesh.RecombineMinimumQuality", min_quality)
-    gmsh.option.setNumber("Mesh.RecombineOptimizeTopology", 1)
-    
-    # More aggressive quality thresholds
+    # === QUALITY SETTINGS ===
+    # Quality type for optimization
     gmsh.option.setNumber("Mesh.QualityType", 2)  # SICN (signed inverse condition number) - best for FEM
     gmsh.option.setNumber("Mesh.OptimizeThreshold", 0.3)  # Optimize elements below this quality
     
     # === SMOOTHING SETTINGS ===
-    # High iteration count for powerful CPUs
-    gmsh.option.setNumber("Mesh.Smoothing", 500)  # Number of smoothing steps
+    # Smoothing is beneficial for subdivided meshes (Lloyd optimization)
+    gmsh.option.setNumber("Mesh.Smoothing", 1000)  # Number of smoothing steps
     gmsh.option.setNumber("Mesh.SmoothRatio", 2.0)  # Max ratio for smoothing
     gmsh.option.setNumber("Mesh.SmoothNormals", 1)  # Smooth normals for better quality
     
-    # Calculate mesh size from boundary if not specified
-    if element_size is None:
+    # === DENSITY ADJUSTMENT FOR SUBDIVISION ===
+    # Since subdivision splits edges in half (and triangles into 3 quads),
+    # we need to use a coarser pre-subdivision mesh to achieve the user's
+    # expected final resolution. Factor of 2.0 compensates for edge splitting.
+    subdivision_factor = 2.0
+    
+    adjusted_divisions = max(2, int(divisions / subdivision_factor))
+    
+    # Calculate target element size for adaptive discretization
+    if element_size is not None:
+        # User provided element_size - account for subdivision
+        target_element_size = element_size * subdivision_factor
+    else:
         # Estimate element size from geometry bounds and divisions
         try:
             bounds = gmsh.model.getBoundingBox(-1, -1)
             diag = math.sqrt((bounds[3]-bounds[0])**2 + (bounds[4]-bounds[1])**2)
-            element_size = diag / (divisions * 2)
+            target_element_size = diag / (adjusted_divisions * 2)
         except:
-            element_size = 0.01  # Default fallback
+            target_element_size = 0.01  # Default fallback
     
-    # Set mesh size at all points
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", element_size * 0.5)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", element_size * 1.5)
+    # Set mesh size constraints (used as fallback by mesher)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", target_element_size * 0.5)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", target_element_size * 1.5)
     
     # Check if transfinite meshing is possible (3 or 4 corners)
+    # Can be overridden by force_adaptive for shapes with varying edge lengths
     num_curves = len(curve_tags)
-    use_transfinite = num_curves in [3, 4]
+    use_transfinite = (num_curves in [3, 4]) and not force_adaptive
+    
+    if force_adaptive and num_curves in [3, 4]:
+        print(f"  Forcing adaptive discretization for {num_curves}-sided shape")
     
     if use_transfinite:
-        print(f"  Using transfinite meshing ({num_curves} curves)")
+        # For transfinite surfaces, use fixed divisions to maintain grid structure
+        # (opposite sides must have matching point counts)
+        print(f"  Using transfinite meshing with subdivision ({num_curves} curves)")
+        print(f"  Adjusted divisions: {divisions} -> {adjusted_divisions} (pre-subdivision)")
         try:
-            # Set transfinite curves
+            # Set transfinite curves with adjusted divisions
             for curve_tag in curve_tags:
                 try:
-                    gmsh.model.mesh.setTransfiniteCurve(curve_tag, divisions + 1)
+                    gmsh.model.mesh.setTransfiniteCurve(curve_tag, adjusted_divisions + 1)
                 except:
                     pass
             
-            # Set transfinite surface
+            # Set transfinite surface (no recombination needed - subdivision handles quads)
             gmsh.model.mesh.setTransfiniteSurface(surface_tag)
-            gmsh.model.mesh.setRecombine(2, surface_tag)
         except Exception as e:
             print(f"  Transfinite failed, using unstructured: {e}")
             use_transfinite = False
     
     if not use_transfinite:
-        print(f"  Using unstructured quad meshing ({num_curves} curves)")
-        # Use unstructured meshing with quad recombination
-        gmsh.model.mesh.setRecombine(2, surface_tag)
+        # === ADAPTIVE CURVE DISCRETIZATION ===
+        # Instead of applying fixed divisions to all curves (which creates
+        # microscopic elements on short edges like fillets), calculate the
+        # number of points based on each curve's actual length.
+        print(f"  Using unstructured meshing with adaptive discretization ({num_curves} curves)")
+        print(f"  Target element size: {target_element_size:.6f} (pre-subdivision)")
         
-        # Set mesh size on curves for better control
+        total_points = 0
         for curve_tag in curve_tags:
             try:
-                gmsh.model.mesh.setTransfiniteCurve(curve_tag, divisions + 1)
-            except:
-                pass
+                # Compute curve length by sampling points along the curve
+                # (works with geo kernel, unlike getMass which requires occ)
+                curve_length = compute_curve_length(curve_tag)
+                
+                # Calculate number of points based on length and target element size
+                # num_points = ceil(length / element_size) + 1 ensures at least 2 points
+                num_points = max(2, math.ceil(curve_length / target_element_size) + 1)
+                
+                gmsh.model.mesh.setTransfiniteCurve(curve_tag, num_points)
+                total_points += num_points
+                print(f"    Curve {curve_tag}: length={curve_length:.6f}, points={num_points}")
+            except Exception as e:
+                # Fallback to minimum if length computation fails
+                print(f"    Curve {curve_tag}: failed to get length ({e}), using minimum")
+                gmsh.model.mesh.setTransfiniteCurve(curve_tag, 2)
+                total_points += 2
+        
+        print(f"  Total curve points: {total_points}")
 
 
 def compute_element_quality(nodes: List[dict], elements: List[dict]) -> dict:
@@ -652,9 +754,16 @@ def build_template(boundary: dict, nodes: List[dict], elements: List[dict]) -> d
 def generate_mesh(boundary_file: str, output_file: str, 
                   divisions: int = 5, element_size: Optional[float] = None,
                   quality: bool = False, preview: bool = False,
-                  min_quality: float = 0.5, optimize_iterations: int = 10,
-                  num_threads: int = 0) -> dict:
-    """Generate mesh from boundary file with high-performance settings.
+                  optimize_iterations: int = 10,
+                  num_threads: int = 0, force_adaptive: bool = False) -> dict:
+    """Generate 100% quad mesh from boundary file using subdivision strategy.
+    
+    Uses the "All-Quads Subdivision" approach to guarantee pure quad output:
+    1. Generates a triangular mesh
+    2. Subdivides each triangle into 3 quads
+    
+    This ensures 0 triangles in output, so downstream 3D extrusion produces
+    pure Hex8 elements for FEBio.
     
     Parameters
     ----------
@@ -670,12 +779,13 @@ def generate_mesh(boundary_file: str, output_file: str,
         Enable mesh quality optimization
     preview : bool
         Show mesh in GMSH GUI before saving
-    min_quality : float
-        Minimum element quality threshold for recombination (0-1)
     optimize_iterations : int
         Number of optimization passes when quality=True
     num_threads : int
         Number of CPU threads (0 = auto-detect all cores)
+    force_adaptive : bool
+        Force adaptive curve discretization even for 3 or 4-sided shapes.
+        Recommended for ring profiles with varying edge lengths.
         
     Returns
     -------
@@ -699,15 +809,28 @@ def generate_mesh(boundary_file: str, output_file: str,
         surface_tag, curve_tags = create_gmsh_geometry(boundary)
         
         # Configure meshing
-        print(f"Configuring mesh (divisions={divisions}, min_quality={min_quality})...")
-        configure_quad_mesh(surface_tag, curve_tags, divisions, element_size, min_quality, num_threads)
+        print(f"Configuring mesh (divisions={divisions}, subdivision strategy for 100% quads)...")
+        configure_quad_mesh(surface_tag, curve_tags, divisions, element_size, num_threads, force_adaptive)
         
-        # Generate mesh
+        # Generate mesh (triangular first, then subdivide to quads)
         print("Generating mesh...", flush=True)
         mesh_start = time.perf_counter()
+        
+        # Step 1: Generate triangular mesh
         gmsh.model.mesh.generate(2)
+        tri_time = time.perf_counter() - mesh_start
+        print(f"  Triangular mesh: {tri_time:.3f}s", flush=True)
+        
+        # Step 2: Apply subdivision to convert triangles to quads
+        # SubdivisionAlgorithm=1 splits each triangle into 3 quads
+        print("  Subdividing triangles to quads...", flush=True)
+        subdiv_start = time.perf_counter()
+        gmsh.model.mesh.refine()
+        subdiv_time = time.perf_counter() - subdiv_start
+        print(f"  Subdivision: {subdiv_time:.3f}s", flush=True)
+        
         mesh_time = time.perf_counter() - mesh_start
-        print(f"  Mesh generation: {mesh_time:.3f}s", flush=True)
+        print(f"  Total mesh generation: {mesh_time:.3f}s", flush=True)
         
         # Optimize if requested
         if quality:
@@ -794,9 +917,8 @@ def generate_mesh(boundary_file: str, output_file: str,
             print("\n--- RECOMMENDATIONS ---")
             print("To improve mesh quality, try:")
             print("  1. Use -q flag for quality optimization")
-            print("  2. Increase --min-quality threshold (e.g., 0.6)")
-            print("  3. Increase --optimize-iter (e.g., 20)")
-            print("  4. Increase divisions (-n) for finer mesh")
+            print("  2. Increase --optimize-iter (e.g., 50)")
+            print("  3. Increase divisions (-n) for finer mesh")
         
         return template
         
@@ -806,7 +928,7 @@ def generate_mesh(boundary_file: str, output_file: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate high-quality quad mesh from Fusion 360 boundary export",
+        description="Generate 100%% quad mesh from Fusion 360 boundary using subdivision strategy",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples (from project root):
@@ -818,7 +940,12 @@ Examples (from project root):
   python scripts/mesh_with_gmsh.py boundaries/boundary.json -q
   
   # Maximum quality for critical simulations:
-  python scripts/mesh_with_gmsh.py boundaries/boundary.json -n 30 -q --min-quality 0.6 --optimize-iter 30
+  python scripts/mesh_with_gmsh.py boundaries/boundary.json -n 30 -q --optimize-iter 30
+
+Subdivision Strategy:
+  This script guarantees 100%% quad output by using GMSH's "All-Quads Subdivision"
+  approach, which subdivides each triangle into 3 quads. This ensures 0 residual
+  triangles, so downstream 3D extrusion produces pure Hex8 elements.
         """
     )
     
@@ -828,7 +955,7 @@ Examples (from project root):
                         default="output_templates/template.json",
                         help="Output template JSON file (default: output_templates/template.json)")
     parser.add_argument("-n", "--divisions", 
-                        type=int, default=10,
+                        type=int, default=4,
                         help="Number of mesh divisions per edge (default: 10)")
     parser.add_argument("--element-size", 
                         type=float, default=None,
@@ -836,19 +963,19 @@ Examples (from project root):
     parser.add_argument("-q", "--quality", 
                         action="store_true",
                         help="Enable aggressive quality optimization (multiple Laplace + Relocate passes)")
-    parser.add_argument("--min-quality",
-                        type=float, default=0.5,
-                        help="Minimum quality threshold for quad recombination (0-1, default: 0.5). "
-                             "Higher values prevent degenerate quads but may leave more triangles.")
     parser.add_argument("--optimize-iter",
-                        type=int, default=40,
-                        help="Number of optimization iterations when -q is used (default: 15)")
+                        type=int, default=80,
+                        help="Number of optimization iterations when -q is used (default: 40)")
     parser.add_argument("--threads",
                         type=int, default=0,
                         help="Number of CPU threads (default: 0 = use GMSH default)")
     parser.add_argument("--preview", 
                         action="store_true",
                         help="Show mesh in GMSH GUI before saving")
+    parser.add_argument("--force-adaptive", 
+                        action="store_true",
+                        help="Force adaptive curve discretization even for 3 or 4-sided shapes. "
+                             "Recommended for ring profiles with varying edge lengths.")
     
     args = parser.parse_args()
     
@@ -870,9 +997,9 @@ Examples (from project root):
             element_size=args.element_size,
             quality=args.quality,
             preview=args.preview,
-            min_quality=args.min_quality,
             optimize_iterations=args.optimize_iter,
-            num_threads=args.threads
+            num_threads=args.threads,
+            force_adaptive=args.force_adaptive
         )
     except Exception as e:
         print(f"Error: {e}")
