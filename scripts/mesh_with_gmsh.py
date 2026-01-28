@@ -251,9 +251,9 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
     This guarantees 100% quad output with no residual triangles, ensuring
     downstream 3D extrusion produces pure Hex8 elements.
     
-    For non-transfinite surfaces, uses adaptive curve discretization based on
-    actual curve lengths to ensure uniform element sizes across edges of
-    different lengths (prevents microscopic elements on short edges like fillets).
+    For non-transfinite surfaces, uses GMSH's native curvature-adaptive meshing
+    which automatically refines curved regions and coarsens straight edges,
+    bounded by CharacteristicLengthMin/Max.
     
     Parameters
     ----------
@@ -306,6 +306,12 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
     gmsh.option.setNumber("Mesh.SmoothRatio", 2.0)  # Max ratio for smoothing
     gmsh.option.setNumber("Mesh.SmoothNormals", 1)  # Smooth normals for better quality
     
+    # === CURVATURE-ADAPTIVE MESHING ===
+    # Enable automatic element sizing based on local curvature (radius R):
+    # h ~= 2 * pi * R / N_nodes
+    # This refines curved regions (fillets) and coarsens straight edges automatically
+    gmsh.option.setNumber("Mesh.CharacteristicLengthFromCurvature", 1)
+    
     # === DENSITY ADJUSTMENT FOR SUBDIVISION ===
     # Since subdivision splits edges in half (and triangles into 3 quads),
     # we need to use a coarser pre-subdivision mesh to achieve the user's
@@ -327,9 +333,27 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
         except:
             target_element_size = 0.01  # Default fallback
     
-    # Set mesh size constraints (used as fallback by mesher)
+    # Set mesh size constraints
+    # Min: ensures resolution on sharp fillets/curves (curvature field can go this small)
+    # Max: allows growth on straight edges and interior (up to 5x larger)
     gmsh.option.setNumber("Mesh.CharacteristicLengthMin", target_element_size * 0.5)
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", target_element_size * 1.5)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", target_element_size * 5.0)
+    
+    # Enable extending mesh size from boundary into interior
+    gmsh.option.setNumber("Mesh.CharacteristicLengthExtendFromBoundary", 1)
+    
+    # Set mesh size at all geometry points to provide baseline sizing
+    # This ensures reasonable element sizes even for straight-line-only geometries
+    # where curvature-adaptive has no effect
+    try:
+        # Get all points in the model
+        points = gmsh.model.getEntities(0)  # dim=0 for points
+        point_tags = [(0, p[1]) for p in points]  # List of (dim, tag) tuples
+        if point_tags:
+            gmsh.model.mesh.setSize(point_tags, target_element_size)
+            print(f"  Set mesh size {target_element_size:.6f} at {len(point_tags)} geometry points")
+    except Exception as e:
+        print(f"  Warning: Could not set point mesh sizes: {e}")
     
     # Check if transfinite meshing is possible (3 or 4 corners)
     # Can be overridden by force_adaptive for shapes with varying edge lengths
@@ -359,34 +383,18 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
             use_transfinite = False
     
     if not use_transfinite:
-        # === ADAPTIVE CURVE DISCRETIZATION ===
-        # Instead of applying fixed divisions to all curves (which creates
-        # microscopic elements on short edges like fillets), calculate the
-        # number of points based on each curve's actual length.
-        print(f"  Using unstructured meshing with adaptive discretization ({num_curves} curves)")
-        print(f"  Target element size: {target_element_size:.6f} (pre-subdivision)")
-        
-        total_points = 0
-        for curve_tag in curve_tags:
-            try:
-                # Compute curve length by sampling points along the curve
-                # (works with geo kernel, unlike getMass which requires occ)
-                curve_length = compute_curve_length(curve_tag)
-                
-                # Calculate number of points based on length and target element size
-                # num_points = ceil(length / element_size) + 1 ensures at least 2 points
-                num_points = max(2, math.ceil(curve_length / target_element_size) + 1)
-                
-                gmsh.model.mesh.setTransfiniteCurve(curve_tag, num_points)
-                total_points += num_points
-                print(f"    Curve {curve_tag}: length={curve_length:.6f}, points={num_points}")
-            except Exception as e:
-                # Fallback to minimum if length computation fails
-                print(f"    Curve {curve_tag}: failed to get length ({e}), using minimum")
-                gmsh.model.mesh.setTransfiniteCurve(curve_tag, 2)
-                total_points += 2
-        
-        print(f"  Total curve points: {total_points}")
+        # === ADAPTIVE UNSTRUCTURED MESHING ===
+        # GMSH's Delaunay algorithm adapts mesh density based on:
+        # - Point-based sizing: baseline target_element_size at geometry points
+        # - CharacteristicLengthFromCurvature: refines curved regions automatically
+        # - CharacteristicLengthExtendFromBoundary: propagates sizes smoothly
+        # - CharacteristicLengthMin/Max: bounds the element sizes
+        # This works for BOTH curved profiles (curvature-adaptive) and
+        # straight-line profiles (point-based sizing creates uniform elements)
+        print(f"  Using adaptive unstructured meshing ({num_curves} curves)")
+        print(f"  Target element size: {target_element_size:.6f}")
+        print(f"  Size bounds: {target_element_size * 0.5:.6f} - {target_element_size * 5.0:.6f}")
+        print(f"  Curved regions auto-refine, straight regions use point-based sizing")
 
 
 def compute_element_quality(nodes: List[dict], elements: List[dict]) -> dict:
