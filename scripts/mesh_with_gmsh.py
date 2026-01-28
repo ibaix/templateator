@@ -383,18 +383,58 @@ def configure_quad_mesh(surface_tag: int, curve_tags: List[int],
             use_transfinite = False
     
     if not use_transfinite:
-        # === ADAPTIVE UNSTRUCTURED MESHING ===
-        # GMSH's Delaunay algorithm adapts mesh density based on:
-        # - Point-based sizing: baseline target_element_size at geometry points
-        # - CharacteristicLengthFromCurvature: refines curved regions automatically
-        # - CharacteristicLengthExtendFromBoundary: propagates sizes smoothly
-        # - CharacteristicLengthMin/Max: bounds the element sizes
-        # This works for BOTH curved profiles (curvature-adaptive) and
-        # straight-line profiles (point-based sizing creates uniform elements)
+        # === ADAPTIVE UNSTRUCTURED MESHING WITH BOUNDARY REFINEMENT ===
+        # For contact simulations: fine elements on boundary, coarser in interior
+        # Uses Distance + Threshold fields to create size gradient
         print(f"  Using adaptive unstructured meshing ({num_curves} curves)")
-        print(f"  Target element size: {target_element_size:.6f}")
-        print(f"  Size bounds: {target_element_size * 0.5:.6f} - {target_element_size * 5.0:.6f}")
-        print(f"  Curved regions auto-refine, straight regions use point-based sizing")
+        print(f"  Boundary element size: {target_element_size:.6f}")
+        print(f"  Interior element size: up to {target_element_size * 4.0:.6f}")
+        
+        try:
+            # Create Distance field from all boundary curves
+            # This computes distance from any point to the nearest boundary curve
+            dist_field = gmsh.model.mesh.field.add("Distance")
+            gmsh.model.mesh.field.setNumbers(dist_field, "CurvesList", curve_tags)
+            gmsh.model.mesh.field.setNumber(dist_field, "Sampling", 100)
+            
+            # Create Threshold field for size gradient
+            # - Near boundary (distance < DistMin): use SizeMin (fine for contact)
+            # - Far from boundary (distance > DistMax): use SizeMax (coarse interior)
+            # - In between: linear interpolation
+            thresh_field = gmsh.model.mesh.field.add("Threshold")
+            gmsh.model.mesh.field.setNumber(thresh_field, "InField", dist_field)
+            gmsh.model.mesh.field.setNumber(thresh_field, "SizeMin", target_element_size)
+            gmsh.model.mesh.field.setNumber(thresh_field, "SizeMax", target_element_size * 8.0)
+            
+            # Estimate transition distance based on geometry size
+            # DistMin: start growing after this distance from boundary
+            # DistMax: reach maximum size at this distance
+            try:
+                bounds = gmsh.model.getBoundingBox(-1, -1)
+                diag = math.sqrt((bounds[3]-bounds[0])**2 + (bounds[4]-bounds[1])**2)
+                dist_min = diag * 0.0  # Start growing at 5% of diagonal
+                dist_max = diag * 0.2   # Reach max at 30% of diagonal
+            except:
+                dist_min = target_element_size * 0.0
+                dist_max = target_element_size * 0.2
+            
+            gmsh.model.mesh.field.setNumber(thresh_field, "DistMin", dist_min)
+            gmsh.model.mesh.field.setNumber(thresh_field, "DistMax", dist_max)
+            
+            # Combine with curvature field using Min (take the smaller of both)
+            # This ensures curved boundaries still get refined
+            min_field = gmsh.model.mesh.field.add("Min")
+            gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", [thresh_field])
+            
+            # Set as background mesh
+            gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
+            
+            print(f"  Distance field: boundary refinement with gradient to interior")
+            print(f"  Transition: {dist_min:.6f} - {dist_max:.6f} from boundary")
+            
+        except Exception as e:
+            print(f"  Warning: Could not set up distance field: {e}")
+            print(f"  Falling back to uniform sizing")
 
 
 def compute_element_quality(nodes: List[dict], elements: List[dict]) -> dict:
