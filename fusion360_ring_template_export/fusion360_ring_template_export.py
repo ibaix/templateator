@@ -51,10 +51,10 @@ BOUNDARIES_FOLDER = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "boundaries"
 # Construction plane to use for intersection
 MIDPLANE_NAME = "midplane_real"
 
-# Fusion 360 document units setting
-# Set to "mm" if your Fusion 360 document uses millimeters
-# Set to "cm" if your Fusion 360 document uses centimeters (Fusion default)
-FUSION_UNITS = "mm"
+# Fusion 360 API internal units: all geometry (sketch points, radii, etc.) is
+# returned in centimeters (cm), regardless of document display units.
+# We export JSON in mm, so we always convert cm -> mm (scale = 10).
+SCALE_CM_TO_MM = 10.0
 
 # ============================================================================
 # MAIN SCRIPT
@@ -345,7 +345,7 @@ def extract_boundary_curves(profile, sketch):
         List of curve dictionaries with type and coordinates
     """
     curves = []
-    scale = 10.0 if FUSION_UNITS == "cm" else 1.0
+    scale = SCALE_CM_TO_MM
     
     # Get the outer loop of the profile
     outer_loop = None
@@ -379,7 +379,7 @@ def extract_curve_geometry(curve_geo, scale):
     curve_geo : adsk.core.Curve3D
         The curve geometry to extract
     scale : float
-        Scale factor to convert to mm
+        Scale factor (cm to mm); Fusion API uses cm internally.
         
     Returns
     -------
@@ -501,7 +501,7 @@ def sample_curve_points(evaluator, start_param, end_param, scale, num_points=20)
     end_param : float
         End parameter
     scale : float
-        Scale factor to convert to mm
+        Scale factor (cm to mm); Fusion API uses cm internally.
     num_points : int
         Number of points to sample
         
@@ -539,7 +539,7 @@ def extract_boundary_vertices(profile, sketch):
     """
     vertices = []
     seen_coords = set()
-    scale = 10.0 if FUSION_UNITS == "cm" else 1.0
+    scale = SCALE_CM_TO_MM
     tolerance = 1e-6
     
     # Get the outer loop of the profile

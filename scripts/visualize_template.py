@@ -43,8 +43,11 @@ def visualize_template(template, show_node_ids=True, show_element_ids=False):
     nodes = template.get('nodes', [])
     elements = template.get('elements', [])
     
-    # Create node lookup dictionary
-    node_map = {n['id']: (n['x'], n['z']) for n in nodes}
+    # Shift to 0-based axes (profile origin at bottom-left) so height shows 0 to base_height
+    xs = [n['x'] for n in nodes]
+    zs = [n['z'] for n in nodes]
+    x_min, z_min = min(xs), min(zs)
+    node_map = {n['id']: (n['x'] - x_min, n['z'] - z_min) for n in nodes}
     
     # Set up the figure
     fig, ax = plt.subplots(1, 1, figsize=(14, 10))
@@ -102,16 +105,16 @@ def visualize_template(template, show_node_ids=True, show_element_ids=False):
                                          alpha=0.6)
         ax.add_collection(tri_collection)
     
-    # Plot nodes
-    node_x = [n['x'] for n in nodes]
-    node_z = [n['z'] for n in nodes]
+    # Plot nodes (shifted coordinates)
+    node_x = [n['x'] - x_min for n in nodes]
+    node_z = [n['z'] - z_min for n in nodes]
     ax.scatter(node_x, node_z, c='#2d2d44', s=15, zorder=5, edgecolor='white', linewidth=0.5)
     
     # Show node IDs
     if show_node_ids:
         for n in nodes:
             ax.annotate(str(n['id']), 
-                       (n['x'], n['z']), 
+                       (n['x'] - x_min, n['z'] - z_min), 
                        fontsize=5, 
                        ha='left', 
                        va='bottom',
@@ -120,10 +123,10 @@ def visualize_template(template, show_node_ids=True, show_element_ids=False):
                        color='#1a1a2e',
                        alpha=0.8)
     
-    # Set equal aspect ratio and labels
+    # Set equal aspect ratio and labels (axes are relative to profile min, so height = 0 to base_height)
     ax.set_aspect('equal')
-    ax.set_xlabel('X (mm)', fontsize=12)
-    ax.set_ylabel('Z (mm)', fontsize=12)
+    ax.set_xlabel('X (mm, from profile min)', fontsize=12)
+    ax.set_ylabel('Z (mm, height from min)', fontsize=12)
     
     # Title with statistics
     title = f"{template.get('name', 'Template')}\n"
