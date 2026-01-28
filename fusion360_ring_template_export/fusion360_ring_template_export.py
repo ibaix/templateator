@@ -345,7 +345,7 @@ def extract_boundary_curves(profile, sketch):
         List of curve dictionaries with type and coordinates
     """
     curves = []
-    scale = 10.0 if FUSION_UNITS == "cm" else 1.0
+    scale = 10.0 if FUSION_UNITS == "mm" else 1.0
     
     # Get the outer loop of the profile
     outer_loop = None
@@ -602,7 +602,7 @@ def build_boundary_json(curves, vertices):
     return {
         "name": TEMPLATE_NAME,
         "version": "1.0",
-        "units": "mm",
+        "units": FUSION_UNITS,
         "plane": MIDPLANE_NAME,
         
         "metadata": {
